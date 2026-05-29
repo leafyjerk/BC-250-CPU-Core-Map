@@ -103,6 +103,7 @@ This stands entirely on the BC-250 community's reverse-engineering work:
 - **Chester Lam / Chips and Cheese** — the deep-dive on the PS5 Zen 2 cores used in
   the BC-250 (background reference).
 - The **BC-250 Discord** community — collective testing and guidance.
+- Claude - probe tooling
 
 ## License
 
