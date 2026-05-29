@@ -40,6 +40,18 @@ import subprocess
 CORES_PER_CCX = 4          # Zen / Zen 2 CCX width
 PSTATE_MSRS = [0xC0010064 + i for i in range(8)]
 
+# Core-disable fuse SMN addresses by codename, from ZenStates-Core Cpu.cs.
+# APUs relocate the fuse out of the desktop 0x30081xxx region into 0x5Dxxx.
+# Cyan Skillfish (BC-250) is a Zen 2 APU, so Renoir's address is the prime suspect.
+FUSE_CANDIDATES = [
+    (0x0005D3E8, "Renoir (Zen 2 APU)"),
+    (0x0005D449, "Cezanne (Zen 3 APU)"),
+    (0x0005D254, "Picasso/Raven (Zen/Zen+ APU)"),
+    (0x0005D4DC, "Rembrandt"),
+    (0x30081A38, "Matisse (desktop Zen 2)"),   # what retail tools assume; empty on APU
+]
+SCAN_LO, SCAN_HI = 0x0005D200, 0x0005D600      # APU fuse neighborhood (bounded fallback)
+
 REPORT = {}
 LINES = []
 
@@ -230,31 +242,125 @@ def section_pstates():
     REPORT["pstates"] = states
 
 
-# ---- 5. SMN WINDOW CHECK ---------------------------------------------------------
+# ---- 5. SMN CORE-DISABLE FUSE (APU-aware) ----------------------------------------
+def _smn_once(addr):
+    # One setpci call: write index, read data, re-read index. Returns (data, index).
+    o = run(["setpci", "-s", "00:00.0", f"0x60.L={addr:08x}", "0x64.L", "0x60.L"])
+    if not o:
+        return None, None
+    toks = o.split()
+    if len(toks) < 2:
+        return None, None
+    try:
+        return int(toks[0], 16), int(toks[1], 16)
+    except ValueError:
+        return None, None
+
+
+def _smn_verified(addr, samples=5):
+    # Trust data only when the index survived the read. Stable = all samples agree.
+    vals, races = [], 0
+    for _ in range(samples):
+        data, idx = _smn_once(addr)
+        if data is None:
+            return None, False, races
+        if idx != addr:
+            races += 1
+            continue
+        vals.append(data)
+    return (vals[0] if vals else None), (len(vals) > 0 and len(set(vals)) == 1), races
+
+
+def _decode(val):
+    mask = val & 0xFF
+    disabled = [i for i in range(8) if mask & (1 << i)]
+    enabled = [i for i in range(8) if not (mask & (1 << i))]
+    return mask, enabled, disabled
+
+
 def section_smn_check():
-    rule("5. SMN WINDOW CHECK  (documents the core-disable fuse path)")
+    rule("5. SMN CORE-DISABLE FUSE  (APU-aware probe)")
     if not shutil.which("setpci"):
-        out("  setpci not found (pciutils); skipping optional check.")
+        out("  setpci not found (pciutils); skipping.")
         return
-    addr = 0x30081A38   # Zen 2 core-disable fuse: 0x30081800 + 0x238 (per ryzen_smu/ZenStates)
-    run(["setpci", "-s", "00:00.0", f"0x60.L={addr:08x}"])
-    data = run(["setpci", "-s", "00:00.0", "0x64.L"])
-    if data is None:
-        out("  Could not run setpci (need root). Skipping.")
+    if os.geteuid() != 0:
+        out("  Need root for SMN access; skipping.")
         return
-    val = int(data.strip(), 16)
-    out(f"  NB SMN index 0x60 <- 0x{addr:08X};  data 0x64 -> 0x{val:08X}")
-    if val == 0xFFFFFFFF:
-        out("  >> Window LOCKED: the CPU core-disable fuse is not readable from")
-        out("     userspace on this board (confirmed via MMIO and intel-conf1).")
-        out("     This is a documented BC-250 finding. Register-level reads would")
-        out("     need the GPU-side SMN path (umr) - see README.")
-        REPORT["smn"] = dict(addr=addr, value="0xFFFFFFFF", locked=True)
+    out("  NB SMN window (00:00.0 0x60 index / 0x64 data) is SHARED with the GPU")
+    out("  SMU/governor. Stop it first for clean reads:")
+    out("      sudo systemctl stop cyan-skillfish-governor-smu")
+    out("  (restart afterwards with: sudo systemctl start cyan-skillfish-governor-smu)")
+    out("")
+
+    topo_dis = set(REPORT.get("coremap", {}).get("disabled", []))
+    topo_en = set(REPORT.get("coremap", {}).get("enabled", []))
+    target_en = len(topo_en) or 6
+
+    out("  Known core-fuse addresses (APUs live in 0x5Dxxx, not 0x30081xxx):")
+    candidates = []        # stable, plausibly-decoded hits
+    for addr, name in FUSE_CANDIDATES:
+        val, stable, races = _smn_verified(addr)
+        if val is None:
+            out(f"    0x{addr:08X}  {name:<27} read failed (need root / no setpci)")
+            continue
+        if val == 0xFFFFFFFF:
+            out(f"    0x{addr:08X}  {name:<27} 0xFFFFFFFF (unmapped on this silicon)")
+        elif not stable:
+            out(f"    0x{addr:08X}  {name:<27} unstable (races={races}; telemetry, not fuse)")
+        else:
+            mask, en, dis = _decode(val)
+            flag = "  <== plausible" if len(en) == target_en else ""
+            out(f"    0x{addr:08X}  {name:<27} 0x{val:08X} mask=0x{mask:02X} off={dis}{flag}")
+            if len(en) == target_en:
+                candidates.append((addr, name, val, mask, en, dis))
+
+    # Bounded scan only if no named address produced a plausible mask.
+    if not candidates:
+        out("")
+        out(f"  No named address matched. Bounded scan 0x{SCAN_LO:05X}-0x{SCAN_HI:05X}")
+        out("  for a stable register leaving exactly {0} enabled cores (~30s)...".format(target_en))
+        for addr in range(SCAN_LO, SCAN_HI, 4):
+            val, stable, _ = _smn_verified(addr, samples=3)
+            if val is None or not stable or val in (0x0, 0xFFFFFFFF):
+                continue
+            mask, en, dis = _decode(val)
+            if len(en) == target_en:
+                out(f"    0x{addr:08X} = 0x{val:08X}  mask=0x{mask:02X}  off={dis}  <== candidate")
+                candidates.append((addr, "scan", val, mask, en, dis))
+
+    out("")
+    # Prefer the candidate whose disabled set exactly matches topology.
+    hit = None
+    for c in candidates:
+        if set(c[5]) == topo_dis and topo_dis:
+            hit = c
+            break
+    if hit is None and candidates:
+        hit = candidates[0]
+
+    if hit:
+        addr, name, val, mask, en, dis = hit
+        out(f"  >> Core-disable fuse @ 0x{addr:08X} = 0x{val:08X}   ({name})")
+        out(f"     mask 0x{mask:02X}  ->  enabled {en}   disabled {dis}")
+        factory_fused = (set(dis) == topo_dis and bool(topo_dis))
+        if factory_fused:
+            out(f"     Matches topology (cores {sorted(topo_dis)} off). The FUSE reports")
+            out("     these cores disabled => FACTORY-FUSED. Hard lock; the PSP enforces")
+            out("     fuse state at boot, so an OS-side unlock is almost certainly out.")
+        elif not dis and topo_dis:
+            out(f"     Fuse shows NO cores disabled, yet the OS sees only {len(topo_en)}.")
+            out("     => CONFIG / downcore-disabled, not fused. This is the softer case;")
+            out("     a downcore/CCD config path may exist (still PSP-gated - verify).")
+        else:
+            out(f"     Fuse-off {dis} vs topology-off {sorted(topo_dis)}: investigate the")
+            out("     mismatch (bit ordering or wrong register) before trusting it.")
+        REPORT["smn"] = dict(fuse_addr=f"0x{addr:08X}", source=name, value=f"0x{val:08X}",
+                             mask=f"0x{mask:02X}", enabled=en, disabled=dis,
+                             factory_fused=factory_fused)
     else:
-        mask = val & 0xFF
-        out(f"  >> Window OPEN: low byte 0x{mask:02X} = core-disable mask "
-            f"(set bits = off cores).")
-        REPORT["smn"] = dict(addr=addr, value=f"0x{val:08X}", mask=mask, locked=False)
+        out("  >> No plausible core-disable fuse at known APU addresses or in the scan.")
+        out("     Stop the governor and re-run; if still nothing, widen SCAN_LO/SCAN_HI.")
+        REPORT["smn"] = dict(found=False)
 
 
 def section_summary():
@@ -268,7 +374,12 @@ def section_summary():
     if cm:
         out(f"  physical cores: {cm.get('total')}  enabled {cm.get('enabled')}  off {cm.get('disabled')}")
         out(f"  ccx split     : {' + '.join(str(s) for s in cm.get('split', []))}")
-    out(f"  smn fuse path : {'LOCKED' if smn.get('locked') else smn.get('value', 'n/a')}")
+    smn = REPORT.get("smn", {})
+    if smn.get("fuse_addr"):
+        out(f"  core fuse     : {smn['fuse_addr']} = {smn['value']}  mask {smn['mask']}  off {smn['disabled']}")
+        out(f"  fuse verdict  : {'FACTORY-FUSED (hard lock)' if smn.get('factory_fused') else 'see report (possible config-disable)'}")
+    else:
+        out("  core fuse     : not found at known APU addresses (stop governor + re-run)")
 
 
 def main():
